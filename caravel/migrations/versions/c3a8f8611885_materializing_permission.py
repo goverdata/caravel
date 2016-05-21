@@ -12,6 +12,7 @@ down_revision = '4fa88fe24e94'
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.orm.strategy_options import Load
 from caravel import db
 from caravel import models
 
@@ -21,7 +22,12 @@ def upgrade():
     op.add_column('slices', sa.Column('perm', sa.String(length=2000), nullable=True))
     session = db.Session(bind=bind)
 
-    for slc in session.query(models.Slice).all():
+    # slices.elasticsearch_datasource_id and elasticsearch_datasource don't exists yet
+    for slc in session.query(models.Slice).options(
+        Load(models.Slice).load_only("perm"),
+        Load(models.SqlaTable).load_only("id", "table_name", "database_id"),
+        Load(models.DruidDatasource).load_only("id", "datasource_name", "cluster_name")
+        ).all():
         if slc.datasource:
             slc.perm = slc.datasource.perm
             session.merge(slc)

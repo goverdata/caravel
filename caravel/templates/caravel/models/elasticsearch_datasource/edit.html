@@ -1,0 +1,7 @@
+{% extends "appbuilder/general/model/edit.html" %}
+
+{% import "caravel/models/elasticsearch_datasource/macros.html" as macros %}
+{% block tail_js %}
+  {{ super() }}
+  {{ macros.testelasticsearch() }}
+{% endblock %}

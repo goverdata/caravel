@@ -24,6 +24,7 @@ from flask.ext.babelpkg import gettext as __
 from flask.ext.babelpkg import lazy_gettext as _
 from flask_appbuilder.models.sqla.filters import BaseFilter
 
+from elasticsearch import NotFoundError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.sql.expression import TextAsFrom
 from werkzeug.routing import BaseConverter
@@ -209,6 +210,35 @@ class DruidColumnInlineView(CompactCRUDMixin, CaravelModelView):  # noqa
 appbuilder.add_view_no_menu(DruidColumnInlineView)
 
 
+class ElasticsearchFieldInlineView(CompactCRUDMixin, CaravelModelView):  # noqa
+    datamodel = SQLAInterface(models.ElasticsearchField)
+    edit_columns = [
+        'column_name', 'description', 'datasource', 'groupby',
+        'count_distinct', 'sum', 'min', 'max']
+    list_columns = [
+        'column_name', 'type', 'index', 'groupby', 'filterable', 'count_distinct',
+        'sum', 'min', 'max']
+    can_delete = False
+    page_size = 500
+
+    label_columns = {
+        'column_name': _("Field"),
+        'type': _("Type"),
+        'datasource': _("Datasource"),
+        'groupby': _("Groupable"),
+        'filterable': _("Filterable"),
+        'count_distinct': _("Count Distinct"),
+        'sum': _("Sum"),
+        'min': _("Min"),
+        'max': _("Max"),
+    }
+
+    def post_update(self, field):
+        field.generate_metrics()
+
+appbuilder.add_view_no_menu(ElasticsearchFieldInlineView)
+
+
 class SqlMetricInlineView(CompactCRUDMixin, CaravelModelView):  # noqa
     datamodel = SQLAInterface(models.SqlMetric)
     list_columns = ['metric_name', 'verbose_name', 'metric_type']
@@ -260,6 +290,28 @@ class DruidMetricInlineView(CompactCRUDMixin, CaravelModelView):  # noqa
         'datasource': _("Druid Datasource"),
     }
 appbuilder.add_view_no_menu(DruidMetricInlineView)
+
+
+class ElasticsearchMetricInlineView(CompactCRUDMixin, CaravelModelView):  # noqa
+    datamodel = SQLAInterface(models.ElasticsearchMetric)
+    list_columns = ['metric_name', 'verbose_name', 'metric_type']
+    edit_columns = [
+        'metric_name', 'description', 'verbose_name', 'metric_type', 'json',
+        'datasource']
+    add_columns = edit_columns
+    page_size = 500
+    validators_columns = {
+        'json': [validate_json],
+    }
+    label_columns = {
+        'metric_name': _("Metric"),
+        'description': _("Description"),
+        'verbose_name': _("Verbose Name"),
+        'metric_type': _("Type"),
+        'json': _("JSON"),
+        'datasource': _("ElasticSearch Datasource"),
+    }
+appbuilder.add_view_no_menu(ElasticsearchMetricInlineView)
 
 
 class DatabaseView(CaravelModelView, DeleteMixin):  # noqa
@@ -405,6 +457,35 @@ if config['DRUID_IS_ACTIVE']:
         category_icon='fa-database',)
 
 
+class ElasticsearchClusterModelView(CaravelModelView, DeleteMixin):  # noqa
+    datamodel = SQLAInterface(models.ElasticsearchCluster)
+    list_columns = ['cluster_name', 'urls', 'creator', 'changed_on_']
+    add_columns = ['cluster_name', 'urls']
+    search_exclude_columns = ('password',)
+    edit_columns = add_columns
+    base_order = ('changed_on', 'desc')
+    label_columns = {
+        'cluster_name': _("Cluster"),
+    }
+
+    def pre_add(self, cl):
+        conn = sqla.engine.url.make_url(cl.urls)
+        cl.password = conn.password
+        conn.password = "X" * 10 if conn.password else None
+        cl.urls = str(conn)  # hides the password
+
+    def pre_update(self, db):
+        self.pre_add(db)
+
+
+if config['ELASTICSEARCH_IS_ACTIVE']:
+    appbuilder.add_view(
+        ElasticsearchClusterModelView,
+        _("ElasticSearch Clusters"),
+        icon="fa-cubes",
+        category=_("Sources"),
+        category_icon='fa-database',)
+
 
 class SliceModelView(CaravelModelView, DeleteMixin):  # noqa
     datamodel = SQLAInterface(models.Slice)
@@ -416,8 +497,9 @@ class SliceModelView(CaravelModelView, DeleteMixin):  # noqa
     list_columns = [
         'slice_link', 'viz_type', 'datasource_link', 'creator', 'modified']
     edit_columns = [
-        'slice_name', 'description', 'viz_type', 'druid_datasource',
-        'table', 'owners', 'dashboards', 'params', 'cache_timeout']
+        'slice_name', 'description', 'viz_type', 'elasticsearch_datasource',
+        'druid_datasource', 'table', 'owners', 'dashboards', 'params',
+        'cache_timeout']
     base_order = ('changed_on', 'desc')
     description_columns = {
         'description': Markup(
@@ -596,6 +678,55 @@ if config['DRUID_IS_ACTIVE']:
         icon="fa-cube")
 
 
+class ElasticsearchDatasourceModelView(CaravelModelView, DeleteMixin):  # noqa
+    datamodel = SQLAInterface(models.ElasticsearchDatasource)
+    list_columns = [
+        'datasource_link', 'cluster', 'changed_by_', 'modified', 'offset']
+    related_views = [ElasticsearchFieldInlineView, ElasticsearchMetricInlineView]
+    edit_columns = [
+        'datasource_name', 'cluster', 'index_name', 'main_dttm_col',
+        'description', 'owner',
+        'is_featured', 'default_endpoint', 'offset',
+        'cache_timeout']
+    add_columns = edit_columns
+    add_template = "caravel/models/elasticsearch_datasource/add.html"
+    edit_template = "caravel/models/elasticsearch_datasource/edit.html"
+    base_order = ('datasource_name', 'asc')
+    label_columns = {
+        'datasource_name': _("Data Source"),
+        'cluster': _("Cluster"),
+        'description': _("Description"),
+        'owner': _("Owner"),
+        'is_featured': _("Is Featured"),
+        'default_endpoint': _("Default Endpoint"),
+        'offset': _("Time Offset"),
+        'cache_timeout': _("Cache Timeout"),
+    }
+
+    def post_add(self, datasource):
+        try:
+            datasource.refresh_fields()
+        except Exception as e:
+            logging.exception(e)
+            flash(
+                "Unable to refresh fields for [{}], "
+                "couldn't fetch metadata".format(datasource.datasource_name),
+                "danger")
+        datasource.generate_metrics()
+        utils.merge_perm(sm, 'datasource_access', datasource.perm)
+
+    def post_update(self, datasource):
+        self.post_add(datasource)
+
+if config['ELASTICSEARCH_IS_ACTIVE']:
+    appbuilder.add_view(
+        ElasticsearchDatasourceModelView,
+        "ElasticSearch Datasources",
+        label=_("ElasticSearch Datasources"),
+        category="Sources",
+        icon="fa-cube")
+
+
 @app.route('/health')
 def health():
     return "OK"
@@ -649,8 +780,9 @@ class Caravel(BaseView):
     @log_this
     def explore(self, datasource_type, datasource_id):
         error_redirect = '/slicemodelview/list/'
-        datasource_class = models.SqlaTable \
-            if datasource_type == "table" else models.DruidDatasource
+        datasource_class = models.SqlaTable if datasource_type == "table" \
+            else models.ElasticsearchDatasource if datasource_type == "elasticsearch" \
+            else models.DruidDatasource
         datasources = (
             db.session
             .query(datasource_class)
@@ -768,8 +900,10 @@ class Caravel(BaseView):
             if k not in as_list and isinstance(v, list):
                 d[k] = v[0]
 
-        table_id = druid_datasource_id = None
+        table_id = druid_datasource_id = elasticsearch_datasource_id = None
         datasource_type = args.get('datasource_type')
+        if datasource_type in ('elasticsearch'):
+            elasticsearch_datasource_id = args.get('datasource_id')
         if datasource_type in ('datasource', 'druid'):
             druid_datasource_id = args.get('datasource_id')
         elif datasource_type == 'table':
@@ -781,6 +915,7 @@ class Caravel(BaseView):
         slc.params = json.dumps(d, indent=4, sort_keys=True)
         slc.datasource_name = args.get('datasource_name')
         slc.viz_type = args.get('viz_type')
+        slc.elasticsearch_datasource_id = elasticsearch_datasource_id
         slc.druid_datasource_id = druid_datasource_id
         slc.table_id = table_id
         slc.datasource_type = datasource_type
@@ -818,6 +953,8 @@ class Caravel(BaseView):
         model = None
         if model_view == 'TableColumnInlineView':
             model = models.TableColumn
+        elif model_view == 'ElasticsearchFieldInlineView':
+            model = models.ElasticsearchField
         elif model_view == 'DruidColumnInlineView':
             model = models.DruidColumn
 
@@ -877,6 +1014,35 @@ class Caravel(BaseView):
             engine = create_engine(uri, connect_args=connect_args)
             engine.connect()
             return json.dumps(engine.table_names(), indent=4)
+        except Exception:
+            return Response(
+                traceback.format_exc(),
+                status=500,
+                mimetype="application/json")
+
+    @has_access
+    @expose("/testelasticsearch", methods=["POST", "GET"])
+    def testelasticsearch(self):
+        """Tests an ElasticSearch connection"""
+        try:
+            cluster_id = int(request.json.get('cluster_id'))
+            index_name = request.json.get('index_name')
+            session = db.session()
+            cl = session.query(models.ElasticsearchCluster).filter_by(id=cluster_id).first()
+            if cl is None:
+                raise Exception("Cluster with id=%d not found" % cluster_id)
+            es = cl.get_elasticsearch_client()
+            health = es.cluster.health(wait_for_status='yellow', request_timeout=1)
+            try:
+                docs_stats = es.indices.stats(index_name, metric='docs')
+                return json.dumps({
+                    'es_status': 'Seems OK!',
+                    'docs_stats': docs_stats
+                }, indent=4)
+            except NotFoundError as e:
+                return json.dumps({
+                    'es_status': "Index not found"
+                }, indent=4)
         except Exception:
             return Response(
                 traceback.format_exc(),

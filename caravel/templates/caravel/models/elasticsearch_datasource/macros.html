@@ -1,0 +1,49 @@
+{% macro testelasticsearch() %}
+  <script>
+    $("#index_name").parent()
+      .append('<button id="testelasticsearch" class="btn">Test ElasticSearch Connection</button>');
+    $("#index_name").parent()
+      .append('<div id="es_status"></div>');
+    $("#index_name").parent()
+      .append('<div id="docs_stats"></div>');
+    $("#testelasticsearch").click(function(e) {
+      e.preventDefault();
+      var url = "/caravel/testelasticsearch";
+
+      var data = {};
+      try{
+        data = JSON.stringify({
+          cluster_id: $("#cluster").val(),
+          index_name: $("#index_name").val()
+        })
+      } catch(parse_error){
+        alert("Malformed JSON in the extras field: " + parse_error);
+        return false
+      }
+
+      $.ajax({
+        method: "POST",
+        url: url,
+        data: data,
+        dataType: 'json',
+        contentType: "application/json; charset=utf-8"
+      }).done(function(data) {
+        $('#es_status').html(data.es_status);
+        if (data.docs_stats) {
+          div = $('#docs_stats');
+          div.html('Indices:<ul>');
+          $.each(data.docs_stats.indices, function(k, v){
+            var id = 'idx_' + k;
+            div.append('<li id="' + id + '" style="padding: 0px 10px 10px 0px;" class="">' + k + ': ' + v.primaries.docs.count + ' docs</li>')
+          });
+        } else {
+          $('#docs_stats').html("");
+        }
+      }).fail(function(error) {
+          $('#es_status').html("ERROR: " + error.responseText);
+          $('#docs_stats').html("");
+      });
+      return false;
+    });
+  </script>
+{% endmacro %}

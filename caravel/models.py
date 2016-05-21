@@ -11,6 +11,7 @@ import textwrap
 from collections import namedtuple
 from copy import deepcopy, copy
 from datetime import timedelta, datetime, date
+from time import mktime
 
 import humanize
 import pandas as pd
@@ -25,6 +26,7 @@ from flask.ext.appbuilder.models.mixins import AuditMixin
 from flask.ext.appbuilder.models.decorators import renders
 from flask.ext.babelpkg import gettext as _
 
+from elasticsearch import Elasticsearch
 from pydruid.client import PyDruid
 from pydruid.utils.filters import Dimension, Filter
 from pydruid.utils.postaggregator import Postaggregator
@@ -145,6 +147,7 @@ class Slice(Model, AuditMixinNullable):
     slice_name = Column(String(250))
     druid_datasource_id = Column(Integer, ForeignKey('datasources.id'))
     table_id = Column(Integer, ForeignKey('tables.id'))
+    elasticsearch_datasource_id = Column(Integer, ForeignKey('elasticsearch_datasources.id'))
     datasource_type = Column(String(200))
     datasource_name = Column(String(2000))
     viz_type = Column(String(250))
@@ -157,6 +160,8 @@ class Slice(Model, AuditMixinNullable):
         'SqlaTable', foreign_keys=[table_id], backref='slices')
     druid_datasource = relationship(
         'DruidDatasource', foreign_keys=[druid_datasource_id], backref='slices')
+    elasticsearch_datasource = relationship(
+        'ElasticsearchDatasource', foreign_keys=[elasticsearch_datasource_id], backref='slices')
     owners = relationship("User", secondary=slice_user)
 
     def __repr__(self):
@@ -164,7 +169,7 @@ class Slice(Model, AuditMixinNullable):
 
     @property
     def datasource(self):
-        return self.table or self.druid_datasource
+        return self.table or self.druid_datasource or self.elasticsearch_datasource
 
     @property
     def datasource_link(self):
@@ -172,6 +177,8 @@ class Slice(Model, AuditMixinNullable):
             return self.table.link
         elif self.druid_datasource:
             return self.druid_datasource.link
+        elif self.elasticsearch_datasource:
+            return self.elasticsearch_datasource.link
 
     @property
     def datasource_edit_url(self):
@@ -179,6 +186,8 @@ class Slice(Model, AuditMixinNullable):
             return self.table.url
         elif self.druid_datasource:
             return self.druid_datasource.url
+        elif self.elasticsearch_datasource:
+            return self.elasticsearch_datasource.url
 
     @property
     @utils.memoized
@@ -193,7 +202,7 @@ class Slice(Model, AuditMixinNullable):
 
     @property
     def datasource_id(self):
-        return self.table_id or self.druid_datasource_id
+        return self.table_id or self.druid_datasource_id or self.elasticsearch_datasource_id
 
     @property
     def data(self):
@@ -252,6 +261,9 @@ def set_perm(mapper, connection, target):  # noqa
     elif target.druid_datasource_id:
         src_class = DruidDatasource
         id_ = target.druid_datasource_id
+    elif target.elasticsearch_datasource_id:
+        src_class = ElasticsearchDatasource
+        id_ = target.elasticsearch_datasource_id
     ds = db.session.query(src_class).filter_by(id=int(id_)).first()
     target.perm = ds.perm
 
@@ -1089,7 +1101,7 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
             select=None,):  # noqa
         """Runs a query against Druid and returns a dataframe.
 
-        This query interface is common to SqlAlchemy and Druid
+        This query interface is common to SqlAlchemy, Druid and ElasticSearch
         """
         # TODO refactor into using a TBD Query object
         qry_start_dttm = datetime.now()
@@ -1441,6 +1453,479 @@ class DruidColumn(Model, AuditMixinNullable):
             if not m:
                 session.add(metric)
                 session.flush()
+
+
+class ElasticsearchDatasource(Model, AuditMixinNullable, Queryable):
+
+    """ORM object referencing Elasticsearch datasources (indices)"""
+
+    type = "elasticsearch"
+
+    baselink = "elasticsearchdatasourcemodelview"
+
+    __tablename__ = 'elasticsearch_datasources'
+    id = Column(Integer, primary_key=True)
+    datasource_name = Column(String(255), unique=True)
+    main_dttm_col = Column(String(255))
+    is_featured = Column(Boolean, default=False)
+    description = Column(Text)
+    default_endpoint = Column(Text)
+    index_name = Column(String(255))
+    user_id = Column(Integer, ForeignKey('ab_user.id'))
+    owner = relationship('User', backref='elasticsearch_datasources', foreign_keys=[user_id])
+    cluster_name = Column(
+        String(250), ForeignKey('elasticsearch_clusters.cluster_name'))
+    cluster = relationship(
+        'ElasticsearchCluster', backref='elasticsearch_datasources', foreign_keys=[cluster_name])
+    offset = Column(Integer, default=0)
+    cache_timeout = Column(Integer)
+
+    @property
+    def metrics_combo(self):
+        return sorted(
+            [(m.metric_name, m.verbose_name) for m in self.metrics],
+            key=lambda x: x[1])
+
+    @property
+    def name(self):
+        return self.datasource_name
+
+    @property
+    def perm(self):
+        return (
+            "[{obj.cluster_name}].[{obj.datasource_name}]"
+            "(id:{obj.id})").format(obj=self)
+
+    @property
+    def link(self):
+        return (
+            '<a href="{self.url}">'
+            '{self.datasource_name}</a>').format(**locals())
+
+    @property
+    def full_name(self):
+        return (
+            "[{obj.cluster_name}]."
+            "[{obj.datasource_name}]").format(obj=self)
+
+    @property
+    def dttm_cols(self):
+        l = [c.column_name for c in self.columns if c.type == 'date']
+        if self.main_dttm_col not in l:
+            l.append(self.main_dttm_col)
+        return l
+
+    @property
+    def any_dttm_col(self):
+        cols = self.dttm_cols
+        if cols:
+            return cols[0]
+
+    def __repr__(self):
+        return self.datasource_name
+
+    @property
+    def datasource_link(self):
+        url = "/caravel/explore/{obj.type}/{obj.id}/".format(obj=self)
+        return '<a href="{url}">{obj.datasource_name}</a>'.format(
+            url=url, obj=self)
+
+#    def get_metric_obj(self, metric_name):
+#        return [
+#            m.json_obj for m in self.metrics
+#            if m.metric_name == metric_name
+#        ][0]
+
+    @classmethod
+    def cast_mapping_type(cls, typ):
+        if typ in ['string', 'text', 'keyword']:
+            return 'string'
+        elif typ in ['date']:
+            return 'date'
+        elif typ in ['boolean']:
+            return 'boolean'
+        elif typ in ['byte', 'short', 'integer', 'long', 'float', 'double', 'token_count']:
+            return 'number'
+        elif typ in ['geo_point']:
+            return 'geo_point'
+        elif typ in ['geo_shape']:
+            return 'geo_shape'
+        elif typ in ['ip']:
+            return 'ip'
+        elif typ in ['attachment']:
+            return 'attachment'
+        elif typ in ['murmur3']:
+            return 'murmur3'
+        else:
+            return typ
+
+    def get_field_mapping(self, fields):
+        es = self.cluster.get_elasticsearch_client()
+        return es.indices.get_field_mapping(index=self.index_name, fields=fields,
+            allow_no_indices=False, ignore_unavailable=False, include_defaults=True)
+
+    def refresh_fields(self):
+        m = self.get_field_mapping('*')
+        any_date_col = None
+        for index, index_infos in m.items():
+            for typ, typ_infos in index_infos['mappings'].items():
+                for field, field_infos in typ_infos.items():
+                    if field in config['ELASTICSEARCH_META_FIELDS']:
+                        continue
+                    field_obj = (
+                        db.session
+                        .query(ElasticsearchField)
+                        .filter_by(
+                            datasource_name=self.datasource_name,
+                            column_name=field)
+                        .first()
+                    )
+                    if not field_obj:
+                        field_obj = ElasticsearchField(
+                            datasource_name=self.datasource_name,
+                            column_name=field)
+                        db.session.add(field_obj)
+                    # FIXME detect conflicting types
+                    try:
+                        field_type = field_infos['mapping'][field]['type']
+                    except KeyError:
+                        field_type = 'string'
+                    try:
+                        field_index = field_infos['mapping'][field]['index']
+                    except KeyError:
+                        field_index = ''
+                    try:
+                        field_index = field_infos['mapping'][field]['doc_values']
+                    except KeyError:
+                        doc_values = None
+                    field_obj.type = self.cast_mapping_type(field_type)
+                    field_obj.doc_values = doc_values
+                    field_obj.indexed = field_index != 'no'
+                    field_obj.analyzed = field_index == 'analyzed' or field_type == 'text'
+                    if field_obj.type == 'string':
+                        field_obj.groupby = True
+                        field_obj.filterable = True
+                    if field_obj.type == 'date' and (not any_date_col or field == '@timestamp'):
+                        any_date_col = field
+                    field_obj.datasource = self
+                    db.session.flush()
+        if not self.main_dttm_col:
+            self.main_dttm_col = any_date_col
+        db.session.commit()
+        flasher("Refreshing fields for datasource [{}]"
+            .format(self.datasource_name), "success")
+
+    def generate_metrics(self):
+        for column in self.columns:
+            column.generate_metrics()
+
+    def query(  # elasticsearch
+            self, groupby, metrics,
+            granularity,
+            from_dttm, to_dttm,
+            filter=None,  # noqa
+            is_timeseries=True,
+            timeseries_limit=None,
+            row_limit=None,
+            inner_from_dttm=None, inner_to_dttm=None,
+            extras=None,  # noqa
+            columns=None,):  # noqa
+        """Runs a query against Elasticsearch and returns a dataframe.
+
+        This query interface is common to SqlAlchemy, Druid and ElasticSearch
+        """
+        import inspect
+        frame = inspect.currentframe()
+        args, _, _, values = inspect.getargvalues(frame)
+        for i in args:
+            logging.debug("    %s = %s" % (i, values[i]))
+
+        qry_start_dttm = datetime.now()
+        es = self.cluster.get_elasticsearch_client()
+        # Construct query body
+        body={}
+        body['fields'] = ["*","_source"]
+        body['size'] = 500 # row_limit FIXME "from + size must be less than or equal to: [10000] but was [50000]"
+        aggs = None
+        # FIXME metrics = [u'SUM(num)']
+        metrics_dict = {m.metric_name: m for m in self.metrics}
+        for metric_name in metrics.__reversed__():
+            metric = metrics_dict[metric_name]
+            json_obj = metric.json_obj
+            if aggs != None:
+                json_obj['aggs'] = aggs
+            aggs = { metric_name: json_obj }
+        # groupby
+        if groupby:
+            body['size'] = 0
+            for group in groupby.__reversed__():
+                aggs = {
+                    group: {
+                        "terms": {
+                            "field": group,
+                        },
+                        'aggs': aggs,
+                    }
+                }
+        if aggs != None:
+            body['aggs'] = aggs
+        # FIXME granularity = one day
+        body['sort'] = [{"_score":{"order":"desc","unmapped_type":"boolean"}}]
+        body['query'] = {
+            'filtered': {
+                'filter': {
+                    "bool": {
+                        "must": [],
+                        "must_not":[]
+                    }
+                }
+            }
+        }
+        # from_dttm = 2016-05-21 13:47:05
+        # to_dttm = 2016-05-28 13:47:05
+        if self.main_dttm_col:
+            body['query']['filtered']['filter']['bool']['must'] += [{
+                "range": {
+                     self.main_dttm_col: {
+                        "gte": int(round(mktime(from_dttm.timetuple())*1000+from_dttm.microsecond/1000)),
+                        "lte": int(round(mktime(to_dttm.timetuple())*1000+to_dttm.microsecond/1000)),
+                        "format": "epoch_millis",
+                    }
+                }
+            }]
+        # filter = [(u'field', u'in', u'value')]
+        if filter:
+            must = []
+            must_not = []
+            for col, op, eq in filter:
+                if op in ('in', 'not in'):
+                    for value in eq.split(","):
+                        if op == 'not in':
+                            must_not.append({'term': { col: value}})
+                        else:
+                            must.append({'term': { col: value}})
+                elif op in ('term', 'not term'):
+                    if op == 'not term':
+                        must_not.append({'term': { col: eq}})
+                    else:
+                        must.append({'term': { col: eq}})
+            body['query']['filtered']['filter']['bool']['must'] += must
+            body['query']['filtered']['filter']['bool']['must_not'] += must_not
+        # FIXME is_timeseries = False
+        # FIXME timeseries_limit = 0
+        if is_timeseries:
+            body['aggs'] = {
+                "2": {
+                    "date_histogram": {
+                        "field":  self.main_dttm_col,
+                        "interval":"3h",
+                        "time_zone":"Europe/Berlin",
+                        "min_doc_count":0,
+                        "extended_bounds":{"min":1463946800567,"max":1464551600568}
+                    }
+                }
+            }
+        # FIXME inner_from_dttm = None
+        # FIXME inner_to_dttm = None
+        # FIXME extras = {u'druid_time_origin': u'', u'time_grain_sqla': u'', u'where': u'', u'having': u''}
+        # FIXME columns = None
+        # body['scripted_fields'] =
+        # body['highlight'] =
+        resp = es.search(
+            index=self.index_name,
+            body=body,
+            timeout='10s', # 0?
+            ignore_unavailable=True,
+            )
+        def prepare_agg_buckets(aggs, current_hash, parent_name='ROOT'):
+            for agg_name, agg in aggs.items():
+                if type(agg) is not dict:
+                    current_hash.update({
+                        parent_name+'/'+agg_name: agg,
+                    })
+            for agg_name, agg in aggs.items():
+                if type(agg) is dict:
+                    agg_hash = current_hash.copy()
+                    for attr_name, attr_value in agg.items():
+                        if attr_name != 'buckets':
+                            agg_hash.update({
+                                agg_name + '/' + attr_name: attr_value,
+                            })
+                    if agg.has_key('buckets'):
+                        for bucket in agg['buckets']:
+                            bucket_hash = prepare_agg_buckets(bucket, agg_hash, agg_name)
+                            for b in bucket_hash:
+                                yield b
+                    else:
+                        yield agg_hash
+        def prepare_records(resp):
+            if resp['aggregations']:
+                for rec in prepare_agg_buckets(resp['aggregations'], {}):
+                    yield rec
+            else:
+                for hit in resp['hits']['hits']:
+                    for k, v in hit['_source'].items():
+                        hit[k] = v
+                    del hit['_source']
+                    yield hit
+        records = prepare_records(resp)
+        df = pd.DataFrame.from_records(records)
+        return QueryResult(
+            df=df,
+            query=json.dumps(body, indent=4, sort_keys=True),
+            duration=datetime.now() - qry_start_dttm)
+
+
+class ElasticsearchCluster(Model, AuditMixinNullable):
+
+    """ORM object referencing the ElasticSearch clusters"""
+
+    __tablename__ = 'elasticsearch_clusters'
+    id = Column(Integer, primary_key=True)
+    cluster_name = Column(String(250), unique=True)
+    urls = Column(Text)
+    password = Column(EncryptedType(String(1024), config.get('SECRET_KEY')))
+
+    def __repr__(self):
+        return self.cluster_name
+
+    def get_elasticsearch_client(self):
+        cli = Elasticsearch(self.urls.split(','), verify_certs=True)
+        return cli
+
+
+class ElasticsearchMetric(Model, AuditMixinNullable):
+
+    """ORM object referencing ElasticSearch metrics for a datasource"""
+
+    __tablename__ = 'elasticsearch_metrics'
+    id = Column(Integer, primary_key=True)
+    metric_name = Column(String(512))
+    verbose_name = Column(String(1024))
+    metric_type = Column(String(32))
+    datasource_name = Column(
+        String(250),
+        ForeignKey('elasticsearch_datasources.datasource_name'))
+    # Setting enable_typechecks=False disables polymorphic inheritance.
+    datasource = relationship('ElasticsearchDatasource', backref='metrics',
+                              enable_typechecks=False)
+    json = Column(Text)
+    description = Column(Text)
+
+    @property
+    def json_obj(self):
+        try:
+            obj = json.loads(self.json)
+        except Exception:
+            obj = {}
+        return obj
+
+
+class ElasticsearchField(Model, AuditMixinNullable):
+
+    """ORM model for storing ElasticSearch datasource field metadata"""
+
+    __tablename__ = 'elasticsearch_fields'
+    id = Column(Integer, primary_key=True)
+    datasource_name = Column(
+        String(250),
+        ForeignKey('elasticsearch_datasources.datasource_name'))
+    # Setting enable_typechecks=False disables polymorphic inheritance.
+    datasource = relationship('ElasticsearchDatasource', backref='columns',
+                              enable_typechecks=False)
+    column_name = Column(String(255))
+    is_active = Column(Boolean, default=True)
+    type = Column(String(32))
+    doc_values = Column(Boolean, default=False)
+    indexed = Column(Boolean, default=False)
+    analyzed = Column(Boolean, default=False)
+    description = Column(Text)
+
+    groupby = Column(Boolean, default=False)
+    count_distinct = Column(Boolean, default=False)
+    sum = Column(Boolean, default=False)
+    max = Column(Boolean, default=False)
+    min = Column(Boolean, default=False)
+    filterable = Column(Boolean, default=False)
+
+    def __repr__(self):
+        return self.column_name
+
+    @property
+    def isnum(self):
+        return self.type in ('byte', 'short', 'integer', 'long', 'float', 'double')
+
+    def generate_metrics(self):
+        """Generate metrics based on the column metadata"""
+#        M = DruidMetric  # noqa
+#        metrics = []
+#        metrics.append(DruidMetric(
+#            metric_name='count',
+#            verbose_name='COUNT(*)',
+#            metric_type='count',
+#            json=json.dumps({'type': 'count', 'name': 'count'})
+#        ))
+#        # Somehow we need to reassign this for UDAFs
+#        if self.type in ('DOUBLE', 'FLOAT'):
+#            corrected_type = 'DOUBLE'
+#        else:
+#            corrected_type = self.type
+
+#        if self.sum and self.isnum:
+#            mt = corrected_type.lower() + 'Sum'
+#            name = 'sum__' + self.column_name
+#            metrics.append(DruidMetric(
+#                metric_name=name,
+#                metric_type='sum',
+#                verbose_name='SUM({})'.format(self.column_name),
+#                json=json.dumps({
+#                    'type': mt, 'name': name, 'fieldName': self.column_name})
+#            ))
+#        if self.min and self.isnum:
+#            mt = corrected_type.lower() + 'Min'
+#            name = 'min__' + self.column_name
+#            metrics.append(DruidMetric(
+#                metric_name=name,
+#                metric_type='min',
+#                verbose_name='MIN({})'.format(self.column_name),
+#                json=json.dumps({
+#                    'type': mt, 'name': name, 'fieldName': self.column_name})
+#            ))
+#        if self.max and self.isnum:
+#            mt = corrected_type.lower() + 'Max'
+#            name = 'max__' + self.column_name
+#            metrics.append(DruidMetric(
+#                metric_name=name,
+#                metric_type='max',
+#                verbose_name='MAX({})'.format(self.column_name),
+#                json=json.dumps({
+#                    'type': mt, 'name': name, 'fieldName': self.column_name})
+#            ))
+#        if self.count_distinct:
+#            mt = 'count_distinct'
+#            name = 'count_distinct__' + self.column_name
+#            metrics.append(DruidMetric(
+#                metric_name=name,
+#                verbose_name='COUNT(DISTINCT {})'.format(self.column_name),
+#                metric_type='count_distinct',
+#                json=json.dumps({
+#                    'type': 'cardinality',
+#                    'name': name,
+#                    'fieldNames': [self.column_name]})
+#            ))
+#        session = get_session()
+#        for metric in metrics:
+#            m = (
+#                session.query(M)
+#                .filter(M.metric_name == metric.metric_name)
+#                .filter(M.datasource_name == self.datasource_name)
+#                .filter(DruidCluster.cluster_name == self.datasource.cluster_name)
+#                .first()
+#            )
+#            metric.datasource_name = self.datasource_name
+#            if not m:
+#                session.add(metric)
+#                session.flush()
 
 
 class FavStar(Model):

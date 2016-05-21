@@ -62,6 +62,10 @@ APP_NAME = "Caravel"
 DRUID_IS_ACTIVE = True
 DRUID_TZ = tz.tzutc()
 
+# ElasticSearch
+ELASTICSEARCH_IS_ACTIVE = True
+ELASTICSEARCH_META_FIELDS = ['_id', '_type', '_source']
+
 # ----------------------------------------------------
 # AUTHENTICATION CONFIG
 # ----------------------------------------------------

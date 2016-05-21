@@ -807,6 +807,9 @@ class FormFactory(object):
             field_css_classes['granularity'] = ['form-control', 'select2_freeform']
             field_css_classes['druid_time_origin'] = ['form-control', 'select2_freeform']
             filter_choices = self.choicify(['in', 'not in', 'regex'])
+        elif datasource_classname == 'ElasticsearchDatasource':
+            time_fields = ()
+            filter_choices = self.choicify(['in', 'not in', 'term', 'not term'])
         add_to_form(('since', 'until'))
 
         filter_cols = viz.datasource.filterable_column_names or ['']
@@ -823,7 +826,7 @@ class FormFactory(object):
                 QueryForm, 'flt_eq_' + str(i),
                 TextField("Super", default=''))
 
-        if time_fields:
+        if time_fields != None:
             QueryForm.fieldsets = ({
                 'label': 'Time',
                 'fields': (

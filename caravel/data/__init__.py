@@ -39,6 +39,87 @@ def get_or_create_db(session):
     return dbobj
 
 
+def get_or_create_elasticsearch_cluster(urls):
+    session = db.session
+    print("Creating ElasticSearch cluster reference")
+    clusterobj = session.query(models.ElasticsearchCluster).filter_by(cluster_name='ElasticSearch examples').first()
+    if not clusterobj:
+        clusterobj = models.ElasticsearchCluster(cluster_name='ElasticSearch examples')
+    clusterobj.urls = urls
+    db.session.add(clusterobj)
+
+    db.session.commit()
+    return clusterobj
+
+
+def import_data(file_name, table_name, description, dtype, es_cluster):
+    if es_cluster:
+        ds_name = "example-%s" % table_name
+        print("Dumping to ElasticSearch index [%s] from [%s]" % (ds_name, file_name))
+        with gzip.open(os.path.join(DATA_FOLDER, file_name)) as f:
+            pdf = pd.read_json(f)
+        es = es_cluster.get_elasticsearch_client()
+        es.indices.delete(
+            index=ds_name,
+            ignore=404)
+        body=''
+        for _, row in pdf.iterrows():
+            body += '{"index":{}}\n' + row.to_json() + '\n'
+        es.bulk(
+            index=ds_name,
+            doc_type=table_name,
+            body=body)
+        print("Creating ElasticSearch datasource [%s] reference" % ds_name)
+        obj = db.session.query(models.ElasticsearchDatasource).filter_by(datasource_name=ds_name).first()
+        if not obj:
+            obj = models.ElasticsearchDatasource(datasource_name=ds_name)
+        if table_name == 'birth_names':
+            obj.main_dttm_col = 'ds'
+        elif table_name == 'wb_health_population':
+            obj.main_dttm_col = 'year'
+        obj.cluster = es_cluster
+        obj.description = description
+        obj.is_featured = True
+        db.session.merge(obj)
+        db.session.commit()
+        obj.refresh_fields()
+        obj.generate_metrics()
+    else:
+        print("Creating table [%s] from [%s]" % (table_name, file_name))
+        with gzip.open(os.path.join(DATA_FOLDER, file_name)) as f:
+            pdf = pd.read_json(f)
+        pdf.columns = [col.replace('.', '_') for col in pdf.columns]
+        if table_name == 'birth_names':
+            pdf.ds = pd.to_datetime(pdf.ds, unit='ms')
+        elif table_name == 'wb_health_population':
+            pdf.year = pd.to_datetime(pdf.year)
+
+        pdf.to_sql(
+            table_name,
+            db.engine,
+            if_exists='replace',
+            chunksize=500,
+            dtype=dtype,
+            index=False)
+
+        print("Creating table [%s] reference" % table_name)
+        obj = db.session.query(TBL).filter_by(table_name=table_name).first()
+        if not obj:
+            obj = TBL(table_name=table_name)
+        if table_name == 'birth_names':
+            obj.main_dttm_col = 'ds'
+        elif table_name == 'wb_health_population':
+            obj.main_dttm_col = 'year'
+        obj.database = get_or_create_db(db.session)
+        obj.description = description
+        obj.is_featured = True
+        db.session.merge(obj)
+        db.session.commit()
+        obj.fetch_metadata()
+    print("-" * 80)
+    return obj
+
+
 def merge_slice(slc):
     o = db.session.query(Slice).filter_by(slice_name=slc.slice_name).first()
     if o:
@@ -53,34 +134,18 @@ def get_slice_json(defaults, **kwargs):
     return json.dumps(d, indent=4, sort_keys=True)
 
 
-def load_energy():
+def load_energy(es_cluster=None):
     """Loads an energy related dataset to use with sankey and graphs"""
-    tbl_name = 'energy_usage'
-    with gzip.open(os.path.join(DATA_FOLDER, 'energy.json.gz')) as f:
-        pdf = pd.read_json(f)
-    pdf.to_sql(
-        tbl_name,
-        db.engine,
-        if_exists='replace',
-        chunksize=500,
+    tbl = import_data(
+        file_name='energy.json.gz',
+        table_name='energy_usage',
+        description="Energy consumption",
         dtype={
             'source': String(255),
             'target': String(255),
             'value': Float(),
         },
-        index=False)
-
-    print("Creating table [energy_usage] reference")
-    tbl = db.session.query(TBL).filter_by(table_name=tbl_name).first()
-    if not tbl:
-        tbl = TBL(table_name=tbl_name)
-    tbl.description = "Energy consumption"
-    tbl.is_featured = True
-    tbl.database = get_or_create_db(db.session)
-    db.session.merge(tbl)
-    db.session.commit()
-    tbl.fetch_metadata()
-
+        es_cluster=es_cluster)
     merge_slice(
         Slice(
             slice_name="Energy Sankey",
@@ -175,37 +240,19 @@ def load_energy():
     )
 
 
-def load_world_bank_health_n_pop():
+def load_world_bank_health_n_pop(es_cluster=None):
     """Loads the world bank health dataset, slices and a dashboard"""
-    tbl_name = 'wb_health_population'
-    with gzip.open(os.path.join(DATA_FOLDER, 'countries.json.gz')) as f:
-        pdf = pd.read_json(f)
-    pdf.columns = [col.replace('.', '_') for col in pdf.columns]
-    pdf.year = pd.to_datetime(pdf.year)
-    pdf.to_sql(
-        tbl_name,
-        db.engine,
-        if_exists='replace',
-        chunksize=500,
+    tbl = import_data(
+        file_name='countries.json.gz',
+        table_name='wb_health_population',
+        description=utils.readfile(os.path.join(DATA_FOLDER, 'countries.md')),
         dtype={
             'year': DateTime(),
             'country_code': String(3),
             'country_name': String(255),
             'region': String(255),
         },
-        index=False)
-
-    print("Creating table [wb_health_population] reference")
-    tbl = db.session.query(TBL).filter_by(table_name=tbl_name).first()
-    if not tbl:
-        tbl = TBL(table_name=tbl_name)
-    tbl.description = utils.readfile(os.path.join(DATA_FOLDER, 'countries.md'))
-    tbl.main_dttm_col = 'year'
-    tbl.is_featured = True
-    tbl.database = get_or_create_db(db.session)
-    db.session.merge(tbl)
-    db.session.commit()
-    tbl.fetch_metadata()
+        es_cluster=es_cluster)
 
     defaults = {
         "compare_lag": "10",
@@ -467,7 +514,7 @@ def load_world_bank_health_n_pop():
     db.session.commit()
 
 
-def load_css_templates():
+def load_css_templates(es_cluster=None):
     """Loads 2 css templates to demonstrate the feature"""
     print('Creating default CSS templates')
     CSS = models.CssTemplate  # noqa
@@ -567,38 +614,21 @@ def load_css_templates():
     db.session.commit()
 
 
-def load_birth_names():
+def load_birth_names(es_cluster=None):
     """Loading birth name dataset from a zip file in the repo"""
-    with gzip.open(os.path.join(DATA_FOLDER, 'birth_names.json.gz')) as f:
-        pdf = pd.read_json(f)
-    pdf.ds = pd.to_datetime(pdf.ds, unit='ms')
-    pdf.to_sql(
-        'birth_names',
-        db.engine,
-        if_exists='replace',
-        chunksize=500,
+    tbl = import_data(
+        file_name='birth_names.json.gz',
+        table_name='birth_names',
+        description='',
         dtype={
             'ds': DateTime,
             'gender': String(16),
             'state': String(10),
             'name': String(255),
         },
-        index=False)
-    l = []
-    print("Done loading table!")
-    print("-" * 80)
+        es_cluster=es_cluster)
 
-    print("Creating table reference")
-    obj = db.session.query(TBL).filter_by(table_name='birth_names').first()
-    if not obj:
-        obj = TBL(table_name='birth_names')
-    obj.main_dttm_col = 'ds'
-    obj.database = get_or_create_db(db.session)
-    obj.is_featured = True
-    db.session.merge(obj)
-    db.session.commit()
-    obj.fetch_metadata()
-    tbl = obj
+
 
     defaults = {
         "compare_lag": "10",
@@ -813,7 +843,7 @@ def load_birth_names():
     db.session.commit()
 
 
-def load_unicode_test_data():
+def load_unicode_test_data(es_cluster=None):
     """Loading unicode test dataset from a csv file in the repo"""
     df = pd.read_csv(os.path.join(DATA_FOLDER, 'unicode_utf8_unixnl_test.csv'),
                      encoding="utf-8")
@@ -898,7 +928,7 @@ def load_unicode_test_data():
     db.session.commit()
 
 
-def load_random_time_series_data():
+def load_random_time_series_data(es_cluster=None):
     """Loading random time series data from a zip file in the repo"""
     with gzip.open(os.path.join(DATA_FOLDER, 'random_time_series.json.gz')) as f:
         pdf = pd.read_json(f)

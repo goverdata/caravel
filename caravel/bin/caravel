@@ -94,6 +94,39 @@ def load_examples(load_test_data):
         print("Loading [Unicode test data]")
         data.load_unicode_test_data()
 
+@manager.option(
+    '-t', '--load-test-data', action='store_true',
+    help="Load additional test data")
+@manager.option(
+    '--elasticsearch-urls', action='store',
+    help="ElasticSearch URLs to load examples to")
+def load_elasticsearch_examples(load_test_data, elasticsearch_urls):
+    """Loads a set of Slices and Dashboards and a supporting dataset """
+    print("Loading examples into ElasticSearch")
+
+    if not elasticsearch_urls:
+        elasticsearch_urls ='http://localhost:9200/'
+
+    es_cluster = data.get_or_create_elasticsearch_cluster(elasticsearch_urls)
+
+    data.load_css_templates(es_cluster)
+
+    print("Loading energy related dataset")
+    data.load_energy(es_cluster)
+
+    print("Loading [World Bank's Health Nutrition and Population Stats]")
+    data.load_world_bank_health_n_pop(es_cluster)
+
+    print("Loading [Birth names]")
+    data.load_birth_names(es_cluster)
+
+    print("Loading [Random time series data]")
+    data.load_random_time_series_data(es_cluster)
+
+    if load_test_data:
+        print("Loading [Unicode test data]")
+        data.load_unicode_test_data(es_cluster)
+
 @manager.command
 def refresh_druid():
     """Refresh all druid datasources"""
