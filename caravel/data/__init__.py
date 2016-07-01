@@ -78,6 +78,7 @@ def import_data(file_name, table_name, description, dtype, es_cluster):
         elif table_name == 'wb_health_population':
             obj.main_dttm_col = 'year'
         obj.cluster = es_cluster
+        obj.index_name = ds_name
         obj.description = description
         obj.is_featured = True
         db.session.merge(obj)
@@ -150,14 +151,14 @@ def load_energy(es_cluster=None):
         Slice(
             slice_name="Energy Sankey",
             viz_type='sankey',
-            datasource_type='table',
+            datasource_type=tbl.type,
             table=tbl,
             params=textwrap.dedent("""\
             {
                 "collapsed_fieldsets": "",
                 "datasource_id": "3",
                 "datasource_name": "energy_usage",
-                "datasource_type": "table",
+                "datasource_type": tbl.type,
                 "flt_col_0": "source",
                 "flt_eq_0": "",
                 "flt_op_0": "in",
