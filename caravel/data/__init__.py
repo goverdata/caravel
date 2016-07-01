@@ -57,33 +57,32 @@ def import_data(file_name, table_name, description, dtype, es_cluster):
         ds_name = "example-%s" % table_name
         print("Dumping to ElasticSearch index [%s] from [%s]" % (ds_name, file_name))
         with gzip.open(os.path.join(DATA_FOLDER, file_name)) as f:
-            pdf = pd.read_json(f)
+            data = json.loads(f.read())
         es = es_cluster.get_elasticsearch_client()
         es.indices.delete(
             index=ds_name,
             ignore=404)
-        body=''
-        for _, row in pdf.iterrows():
-            body += '{"index":{}}\n' + row.to_json() + '\n'
+        body='\n'.join('{"index":{}}\n%s\n' % json.dumps(row) for row in data)
         es.bulk(
             index=ds_name,
             doc_type=table_name,
             body=body)
         print("Creating ElasticSearch datasource [%s] reference" % ds_name)
-        obj = db.session.query(models.ElasticsearchDatasource).filter_by(datasource_name=ds_name).first()
-        if not obj:
-            obj = models.ElasticsearchDatasource(datasource_name=ds_name)
+        ds = db.session.query(models.ElasticsearchDatasource).filter_by(datasource_name=ds_name).first()
+        if not ds:
+            ds = models.ElasticsearchDatasource(datasource_name=ds_name)
         if table_name == 'birth_names':
-            obj.main_dttm_col = 'ds'
+            ds.main_dttm_col = 'ds'
         elif table_name == 'wb_health_population':
-            obj.main_dttm_col = 'year'
-        obj.cluster = es_cluster
-        obj.description = description
-        obj.is_featured = True
-        db.session.merge(obj)
+            ds.main_dttm_col = 'year'
+        ds.cluster = es_cluster
+        ds.index_name = ds_name
+        ds.description = description
+        ds.is_featured = True
+        db.session.merge(ds)
         db.session.commit()
-        obj.refresh_fields()
-        obj.generate_metrics()
+        ds.refresh_fields()
+        ds.generate_metrics()
     else:
         print("Creating table [%s] from [%s]" % (table_name, file_name))
         with gzip.open(os.path.join(DATA_FOLDER, file_name)) as f:
@@ -93,6 +92,8 @@ def import_data(file_name, table_name, description, dtype, es_cluster):
             pdf.ds = pd.to_datetime(pdf.ds, unit='ms')
         elif table_name == 'wb_health_population':
             pdf.year = pd.to_datetime(pdf.year)
+        elif table_name == 'random_time_series':
+            pdf.ds = pd.to_datetime(pdf.ds, unit='s')
 
         pdf.to_sql(
             table_name,
@@ -103,40 +104,60 @@ def import_data(file_name, table_name, description, dtype, es_cluster):
             index=False)
 
         print("Creating table [%s] reference" % table_name)
-        obj = db.session.query(TBL).filter_by(table_name=table_name).first()
-        if not obj:
-            obj = TBL(table_name=table_name)
+        ds = db.session.query(TBL).filter_by(table_name=table_name).first()
+        if not ds:
+            ds = TBL(table_name=table_name)
+        ds.is_featured = True
         if table_name == 'birth_names':
-            obj.main_dttm_col = 'ds'
+            ds.main_dttm_col = 'ds'
         elif table_name == 'wb_health_population':
-            obj.main_dttm_col = 'year'
-        obj.database = get_or_create_db(db.session)
-        obj.description = description
-        obj.is_featured = True
-        db.session.merge(obj)
+            ds.main_dttm_col = 'year'
+        elif table_name == 'random_time_series':
+            ds.main_dttm_col = 'ds'
+            ds.is_featured = False
+        ds.database = get_or_create_db(db.session)
+        ds.description = description
+        db.session.merge(ds)
         db.session.commit()
-        obj.fetch_metadata()
+        ds.fetch_metadata()
     print("-" * 80)
-    return obj
+    return ds
 
 
-def merge_slice(slc):
-    o = db.session.query(Slice).filter_by(slice_name=slc.slice_name).first()
+
+def get_or_create_slice(slice_name, viz_type, datasource, defaults, params):
+    table = None
+    elasticsearch_datasource = None
+    if datasource.type == 'elasticsearch':
+        slice_name = slice_name + ' (ES)'
+        elasticsearch_datasource = datasource
+    else:
+        table = datasource
+    p = defaults.copy()
+    p['slice_name'] = slice_name
+    p['viz_type'] = viz_type
+    p['datasource_type'] = datasource.type
+    p['datasource_id'] = datasource.id
+    p['datasource_name'] = datasource.name
+    p.update(params)
+    o = db.session.query(Slice).filter_by(slice_name=slice_name).first()
     if o:
         db.session.delete(o)
+    slc = Slice(
+        slice_name=slice_name,
+        viz_type=viz_type,
+        datasource_type=datasource.type,
+        table=table,
+        elasticsearch_datasource=elasticsearch_datasource,
+        params=json.dumps(p, indent=4, sort_keys=True))
     db.session.add(slc)
     db.session.commit()
-
-
-def get_slice_json(defaults, **kwargs):
-    d = defaults.copy()
-    d.update(kwargs)
-    return json.dumps(d, indent=4, sort_keys=True)
+    return slc
 
 
 def load_energy(es_cluster=None):
     """Loads an energy related dataset to use with sankey and graphs"""
-    tbl = import_data(
+    ds = import_data(
         file_name='energy.json.gz',
         table_name='energy_usage',
         description="Energy consumption",
@@ -146,103 +167,78 @@ def load_energy(es_cluster=None):
             'value': Float(),
         },
         es_cluster=es_cluster)
-    merge_slice(
-        Slice(
-            slice_name="Energy Sankey",
-            viz_type='sankey',
-            datasource_type='table',
-            table=tbl,
-            params=textwrap.dedent("""\
-            {
-                "collapsed_fieldsets": "",
-                "datasource_id": "3",
-                "datasource_name": "energy_usage",
-                "datasource_type": "table",
-                "flt_col_0": "source",
-                "flt_eq_0": "",
-                "flt_op_0": "in",
-                "groupby": [
-                    "source",
-                    "target"
-                ],
-                "having": "",
-                "metric": "sum__value",
-                "row_limit": "5000",
-                "slice_id": "",
-                "slice_name": "Energy Sankey",
-                "viz_type": "sankey",
-                "where": ""
-            }
-            """))
+    get_or_create_slice(
+        slice_name="Energy Sankey",
+        viz_type='sankey',
+        datasource=ds,
+        defaults={},
+        params={
+            "collapsed_fieldsets": "",
+            "flt_col_0": "source",
+            "flt_eq_0": "",
+            "flt_op_0": "in",
+            "groupby": [
+                "source",
+                "target"
+            ],
+            "having": "",
+            "metric": "sum__value",
+            "row_limit": "5000",
+            "slice_id": "",
+            "where": ""
+        }
     )
 
-    merge_slice(
-        Slice(
-            slice_name="Energy Force Layout",
-            viz_type='directed_force',
-            datasource_type='table',
-            table=tbl,
-            params=textwrap.dedent("""\
-            {
-                "charge": "-500",
-                "collapsed_fieldsets": "",
-                "datasource_id": "1",
-                "datasource_name": "energy_usage",
-                "datasource_type": "table",
-                "flt_col_0": "source",
-                "flt_eq_0": "",
-                "flt_op_0": "in",
-                "groupby": [
-                    "source",
-                    "target"
-                ],
-                "having": "",
-                "link_length": "200",
-                "metric": "sum__value",
-                "row_limit": "5000",
-                "slice_id": "229",
-                "slice_name": "Force",
-                "viz_type": "directed_force",
-                "where": ""
-            }
-            """))
+    get_or_create_slice(
+        slice_name="Energy Force Layout",
+        viz_type='directed_force',
+        datasource=ds,
+        defaults={},
+        params={
+            "charge": "-500",
+            "collapsed_fieldsets": "",
+            "flt_col_0": "source",
+            "flt_eq_0": "",
+            "flt_op_0": "in",
+            "groupby": [
+                "source",
+                "target"
+            ],
+            "having": "",
+            "link_length": "200",
+            "metric": "sum__value",
+            "row_limit": "5000",
+            "where": ""
+        }
     )
-    merge_slice(
-        Slice(
-            slice_name="Heatmap",
-            viz_type='heatmap',
-            datasource_type='table',
-            table=tbl,
-            params=textwrap.dedent("""\
-            {
-                "all_columns_x": "source",
-                "all_columns_y": "target",
-                "canvas_image_rendering": "pixelated",
-                "collapsed_fieldsets": "",
-                "datasource_id": "1",
-                "datasource_name": "energy_usage",
-                "datasource_type": "table",
-                "flt_col_0": "source",
-                "flt_eq_0": "",
-                "flt_op_0": "in",
-                "having": "",
-                "linear_color_scheme": "blue_white_yellow",
-                "metric": "sum__value",
-                "normalize_across": "heatmap",
-                "slice_id": "229",
-                "slice_name": "Heatmap",
-                "viz_type": "heatmap",
-                "where": "",
-                "xscale_interval": "1",
-                "yscale_interval": "1"
-            }
-            """))
+
+    get_or_create_slice(
+        slice_name="Heatmap",
+        viz_type='heatmap',
+        datasource=ds,
+        defaults={},
+        params={
+            "all_columns_x": "source",
+            "all_columns_y": "target",
+            "canvas_image_rendering": "pixelated",
+            "collapsed_fieldsets": "",
+            "flt_col_0": "source",
+            "flt_eq_0": "",
+            "flt_op_0": "in",
+            "having": "",
+            "linear_color_scheme": "blue_white_yellow",
+            "metric": "sum__value",
+            "normalize_across": "heatmap",
+            "where": "",
+            "xscale_interval": "1",
+            "yscale_interval": "1"
+        }
     )
 
 
 def load_world_bank_health_n_pop(es_cluster=None):
     """Loads the world bank health dataset, slices and a dashboard"""
-    tbl = import_data(
+    ds = import_data(
         file_name='countries.json.gz',
         table_name='wb_health_population',
         description=utils.readfile(os.path.join(DATA_FOLDER, 'countries.md')),
@@ -257,9 +253,6 @@ def load_world_bank_health_n_pop(es_cluster=None):
     defaults = {
         "compare_lag": "10",
         "compare_suffix": "o10Y",
-        "datasource_id": "1",
-        "datasource_name": "birth_names",
-        "datasource_type": "table",
         "limit": "25",
         "granularity": "year",
         "groupby": [],
@@ -278,147 +271,134 @@ def load_world_bank_health_n_pop(es_cluster=None):
 
     print("Creating slices")
     slices = [
-        Slice(
+        get_or_create_slice(
             slice_name="Region Filter",
             viz_type='filter_box',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='filter_box',
-                groupby=['region', 'country_name'])),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ['region', 'country_name'],
+            }),
+        get_or_create_slice(
             slice_name="World's Population",
             viz_type='big_number',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                since='2000',
-                viz_type='big_number',
-                compare_lag="10",
-                metric='sum__SP_POP_TOTL',
-                compare_suffix="over 10Y")),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": '2000',
+                "compare_lag": "10",
+                "metric": 'sum__SP_POP_TOTL',
+                "compare_suffix": "over 10Y",
+            }),
+        get_or_create_slice(
             slice_name="Most Populated Countries",
             viz_type='table',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='table',
-                metrics=["sum__SP_POP_TOTL"],
-                groupby=['country_name'])),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "metrics": ["sum__SP_POP_TOTL"],
+                "groupby": ['country_name'],
+            }),
+        get_or_create_slice(
             slice_name="Growth Rate",
             viz_type='line',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='line',
-                since="1960-01-01",
-                metrics=["sum__SP_POP_TOTL"],
-                num_period_compare="10",
-                groupby=['country_name'])),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "1960-01-01",
+                "metrics": ["sum__SP_POP_TOTL"],
+                "num_period_compare": "10",
+                "groupby": ['country_name'],
+            }),
+        get_or_create_slice(
             slice_name="% Rural",
             viz_type='world_map',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='world_map',
-                metric="sum__SP_RUR_TOTL_ZS",
-                num_period_compare="10")),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "metric": "sum__SP_RUR_TOTL_ZS",
+                "num_period_compare": "10",
+            }),
+        get_or_create_slice(
             slice_name="Life Expexctancy VS Rural %",
             viz_type='bubble',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='bubble',
-                since="2011-01-01",
-                until="2011-01-01",
-                series="region",
-                limit="0",
-                entity="country_name",
-                x="sum__SP_RUR_TOTL_ZS",
-                y="sum__SP_DYN_LE00_IN",
-                size="sum__SP_POP_TOTL",
-                max_bubble_size="50",
-                flt_col_1="country_code",
-                flt_op_1="not in",
-                flt_eq_1="TCA,MNP,DMA,MHL,MCO,SXM,CYM,TUV,IMY,KNA,ASM,ADO,AMA,PLW",
-                num_period_compare="10",)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "2011-01-01",
+                "until": "2011-01-01",
+                "series": "region",
+                "limit": "0",
+                "entity": "country_name",
+                "x": "sum__SP_RUR_TOTL_ZS",
+                "y": "sum__SP_DYN_LE00_IN",
+                "size": "sum__SP_POP_TOTL",
+                "max_bubble_size": "50",
+                "flt_col_1": "country_code",
+                "flt_op_1": "not in",
+                "flt_eq_1": "TCA,MNP,DMA,MHL,MCO,SXM,CYM,TUV,IMY,KNA,ASM,ADO,AMA,PLW",
+                "num_period_compare": "10",
+            }),
+        get_or_create_slice(
             slice_name="Rural Breakdown",
             viz_type='sunburst',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type='sunburst',
-                groupby=["region", "country_name"],
-                secondary_metric="sum__SP_RUR_TOTL",
-                since="2011-01-01",
-                until="2011-01-01",)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ["region", "country_name"],
+                "secondary_metric": "sum__SP_RUR_TOTL",
+                "since": "2011-01-01",
+                "until": "2011-01-01",
+            }),
+        get_or_create_slice(
             slice_name="World's Pop Growth",
             viz_type='area',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                since="1960-01-01",
-                until="now",
-                viz_type='area',
-                groupby=["region"],)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "1960-01-01",
+                "until": "now",
+                "groupby": ["region"],
+            }),
+        get_or_create_slice(
             slice_name="Box plot",
             viz_type='box_plot',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                since="1960-01-01",
-                until="now",
-                whisker_options="Tukey",
-                viz_type='box_plot',
-                groupby=["region"],)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "1960-01-01",
+                "until": "now",
+                "whisker_options": "Tukey",
+                "groupby": ["region"],
+            }),
+        get_or_create_slice(
             slice_name="Treemap",
             viz_type='treemap',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                since="1960-01-01",
-                until="now",
-                viz_type='treemap',
-                metrics=["sum__SP_POP_TOTL"],
-                groupby=["region", "country_code"],)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "1960-01-01",
+                "until": "now",
+                "metrics": ["sum__SP_POP_TOTL"],
+                "groupby": ["region", "country_code"],
+            }),
+        get_or_create_slice(
             slice_name="Parallel Coordinates",
             viz_type='para',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                since="2011-01-01",
-                until="2011-01-01",
-                viz_type='para',
-                limit=100,
-                metrics=[
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "since": "2011-01-01",
+                "until": "2011-01-01",
+                "limit": 100,
+                "metrics": [
                     "sum__SP_POP_TOTL",
                     'sum__SP_RUR_TOTL_ZS',
                     'sum__SH_DYN_AIDS'],
-                secondary_metric='sum__SP_POP_TOTL',
-                series=["country_name"],)),
+                "secondary_metric": 'sum__SP_POP_TOTL',
+                "series": ["country_name"],
+            }),
     ]
-    for slc in slices:
-        merge_slice(slc)
 
     print("Creating a World's Health Bank dashboard")
     dash_name = "World's Bank Data"
@@ -616,7 +596,7 @@ def load_css_templates(es_cluster=None):
 
 def load_birth_names(es_cluster=None):
     """Loading birth name dataset from a zip file in the repo"""
-    tbl = import_data(
+    ds = import_data(
         file_name='birth_names.json.gz',
         table_name='birth_names',
         description='',
@@ -633,9 +613,6 @@ def load_birth_names(es_cluster=None):
     defaults = {
         "compare_lag": "10",
         "compare_suffix": "o10Y",
-        "datasource_id": "1",
-        "datasource_name": "birth_names",
-        "datasource_type": "table",
         "flt_op_1": "in",
         "limit": "25",
         "granularity": "ds",
@@ -645,79 +622,83 @@ def load_birth_names(es_cluster=None):
         "row_limit": config.get("ROW_LIMIT"),
         "since": "100 years ago",
         "until": "now",
-        "viz_type": "table",
         "where": "",
         "markup_type": "markdown",
     }
 
     print("Creating some slices")
     slices = [
-        Slice(
+        get_or_create_slice(
             slice_name="Girls",
             viz_type='table',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                groupby=['name'],
-                flt_col_1='gender',
-                flt_eq_1="girl", row_limit=50)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ['name'],
+                "flt_col_1": 'gender',
+                "flt_eq_1": "girl",
+                "row_limit": 50,
+            }),
+        get_or_create_slice(
             slice_name="Boys",
             viz_type='table',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                groupby=['name'],
-                flt_col_1='gender',
-                flt_eq_1="boy",
-                row_limit=50)),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ['name'],
+                "flt_col_1": 'gender',
+                "flt_eq_1": "boy",
+                "row_limit": 50,
+            }),
+        get_or_create_slice(
             slice_name="Participants",
             viz_type='big_number',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="big_number", granularity="ds",
-                compare_lag="5", compare_suffix="over 5Y")),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "granularity": "ds",
+                "compare_lag": "5",
+                "compare_suffix": "over 5Y",
+            }),
+        get_or_create_slice(
             slice_name="Genders",
             viz_type='pie',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="pie", groupby=['gender'])),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ['gender'],
+            }),
+        get_or_create_slice(
             slice_name="Genders by State",
             viz_type='dist_bar',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                flt_eq_1="other", viz_type="dist_bar",
-                metrics=['sum__sum_girls', 'sum__sum_boys'],
-                groupby=['state'], flt_op_1='not in', flt_col_1='state')),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "flt_eq_1": "other",
+                "metrics": ['sum__sum_girls', 'sum__sum_boys'],
+                "groupby": ['state'],
+                "flt_op_1": 'not in',
+                "flt_col_1": 'state',
+            }),
+        get_or_create_slice(
             slice_name="Trends",
             viz_type='line',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="line", groupby=['name'],
-                granularity='ds', rich_tooltip='y', show_legend='y')),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "groupby": ['name'],
+                "granularity": 'ds',
+                "rich_tooltip": 'y',
+                "show_legend": 'y',
+            }),
+        get_or_create_slice(
             slice_name="Title",
             viz_type='markup',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="markup", markup_type="html",
-                code="""\
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "markup_type": "html",
+                "code": """\
 <div style="text-align:center">
     <h1>Birth Names Dashboard</h1>
     <p>
@@ -726,39 +707,42 @@ def load_birth_names(es_cluster=None):
     </p>
     <img src="http://monblog.system-linux.net/image/tux/baby-tux_overlord59-tux.png">
 </div>
-""")),
-        Slice(
+""",
+            }),
+        get_or_create_slice(
             slice_name="Name Cloud",
             viz_type='word_cloud',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="word_cloud", size_from="10",
-                series='name', size_to="70", rotation="square",
-                limit='100')),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "size_from": "10",
+                "series": 'name',
+                "size_to": "70",
+                "rotation": "square",
+                "limit": '100',
+            }),
+        get_or_create_slice(
             slice_name="Pivot Table",
             viz_type='pivot_table',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="pivot_table", metrics=['sum__num'],
-                groupby=['name'], columns=['state'])),
-        Slice(
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "metrics": ['sum__num'],
+                "groupby": ['name'],
+                "columns": ['state'],
+            }),
+        get_or_create_slice(
             slice_name="Number of Girls",
             viz_type='big_number_total',
-            datasource_type='table',
-            table=tbl,
-            params=get_slice_json(
-                defaults,
-                viz_type="big_number_total", granularity="ds",
-                flt_col_1='gender', flt_eq_1='girl',
-                subheader='total female participants')),
+            datasource=ds,
+            defaults=defaults,
+            params={
+                "granularity": "ds",
+                "flt_col_1": 'gender',
+                "flt_eq_1": 'girl',
+                "subheader": 'total female participants',
+            }),
     ]
-    for slc in slices:
-        merge_slice(slc)
 
     print("Creating a dashboard")
     dash = db.session.query(Dash).filter_by(dashboard_title="Births").first()
@@ -876,12 +860,9 @@ def load_unicode_test_data(es_cluster=None):
     db.session.merge(obj)
     db.session.commit()
     obj.fetch_metadata()
-    tbl = obj
+    ds = obj
 
     slice_data = {
-        "datasource_id": "3",
-        "datasource_name": "unicode_test",
-        "datasource_type": "table",
         "flt_op_1": "in",
         "granularity": "date",
         "groupby": [],
@@ -899,14 +880,13 @@ def load_unicode_test_data(es_cluster=None):
     }
 
     print("Creating a slice")
-    slc = Slice(
+    slc = get_or_create_slice(
         slice_name="Unicode Cloud",
         viz_type='word_cloud',
-        datasource_type='table',
-        table=tbl,
-        params=get_slice_json(slice_data),
+        datasource=ds,
+        defaults={},
+        params=slice_data,
     )
-    merge_slice(slc)
 
     print("Creating a dashboard")
     dash = db.session.query(Dash).filter_by(dashboard_title="Unicode Test").first()
@@ -930,53 +910,27 @@ def load_unicode_test_data(es_cluster=None):
 
 def load_random_time_series_data(es_cluster=None):
     """Loading random time series data from a zip file in the repo"""
-    with gzip.open(os.path.join(DATA_FOLDER, 'random_time_series.json.gz')) as f:
-        pdf = pd.read_json(f)
-    pdf.ds = pd.to_datetime(pdf.ds, unit='s')
-    pdf.to_sql(
-        'random_time_series',
-        db.engine,
-        if_exists='replace',
-        chunksize=500,
+    ds = import_data(
+        file_name='random_time_series.json.gz',
+        table_name='random_time_series',
+        description="Random time series",
         dtype={
             'ds': DateTime,
         },
-        index=False)
-    print("Done loading table!")
-    print("-" * 80)
+        es_cluster=es_cluster)
 
-    print("Creating table reference")
-    obj = db.session.query(TBL).filter_by(table_name='random_time_series').first()
-    if not obj:
-        obj = TBL(table_name='random_time_series')
-    obj.main_dttm_col = 'ds'
-    obj.database = get_or_create_db(db.session)
-    obj.is_featured = False
-    db.session.merge(obj)
-    db.session.commit()
-    obj.fetch_metadata()
-    tbl = obj
-
-    slice_data = {
-        "datasource_id": "6",
-        "datasource_name": "random_time_series",
-        "datasource_type": "table",
-        "granularity": "day",
-        "row_limit": config.get("ROW_LIMIT"),
-        "since": "1 year ago",
-        "until": "now",
-        "where": "",
-        "viz_type": "cal_heatmap",
-        "domain_granularity": "month",
-        "subdomain_granularity": "day",
-    }
-
-    print("Creating a slice")
-    slc = Slice(
+    get_or_create_slice(
         slice_name="Calendar Heatmap",
         viz_type='cal_heatmap',
-        datasource_type='table',
-        table=tbl,
-        params=get_slice_json(slice_data),
+        datasource=ds,
+        defaults={},
+        params={
+            "granularity": "day",
+            "row_limit": config.get("ROW_LIMIT"),
+            "since": "1 year ago",
+            "until": "now",
+            "where": "",
+            "domain_granularity": "month",
+            "subdomain_granularity": "day",
+        },
     )
-    merge_slice(slc)
